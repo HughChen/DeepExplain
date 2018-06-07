@@ -310,6 +310,74 @@ class DeepLIFTRescale(GradientBasedMethod):
             self._deeplift_ref[op.name] = r
         # print('DeepLIFT: references ready')
         sys.stdout.flush()
+        
+        
+"""
+DeepLIFTSHAP
+This reformulation only considers the "Rescale" rule
+https://arxiv.org/abs/1704.02685
+
+Modified to include a reformulation of the baseline that is the average at each the activation function.  Should be more in line with the definition prescribed by Shapley values.
+
+Currently slow.  
+- Move the _init_references() call to the __init__ to avoid calling multiple times for one input.  
+- Could potentially save on computation by not propagating from inputs in the _init_references() function.
+"""
+
+class DeepLIFTRescaleSHAP(GradientBasedMethod):
+
+    _deeplift_ref = {}
+
+    def __init__(self, T, X, xs, session, keras_learning_phase, baseline=None, train_x=None):
+        super(DeepLIFTRescaleSHAP, self).__init__(T, X, xs, session, keras_learning_phase)
+        self.train_x = train_x
+        self.baseline = baseline
+
+    def get_symbolic_attribution(self):
+        return [g * (x - b) for g, x, b in zip(
+            tf.gradients(self.T, self.X),
+            self.X if self.has_multiple_inputs else [self.X],
+            self.baseline if self.has_multiple_inputs else [self.baseline])]
+
+    @classmethod
+    def nonlinearity_grad_override(cls, op, grad):
+        output = op.outputs[0]
+        input = op.inputs[0]
+        ref_input = cls._deeplift_ref[op.name]
+        ref_output = activation(op.type)(ref_input)
+        delta_out = output - ref_output
+        delta_in = input - ref_input
+        instant_grad = activation(op.type)(0.5 * (ref_input + input))
+        return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
+                               original_grad(instant_grad.op, grad))
+
+    def run(self):
+        # Check user baseline or set default one
+        self._set_check_baseline()
+
+        # Init references with a forward pass
+        self._init_references()
+
+        # Run the default run
+        return super(DeepLIFTRescaleSHAP, self).run()
+
+    def _init_references(self):
+        # print ('DeepLIFT: computing references...')
+        sys.stdout.flush()
+        self._deeplift_ref.clear()
+        ops = []
+        g = tf.get_default_graph()
+        for op in g.get_operations():
+            if len(op.inputs) > 0 and not op.name.startswith('gradients'):
+                if op.type in SUPPORTED_ACTIVATIONS:
+                    ops.append(op)
+        for op in ops:
+            r = self.session_run(op.inputs[0], self.train_x[0:0+1,:])
+            for i in range(1,self.train_x.shape[0]):
+                r += self.session_run(op.inputs[0], self.train_x[i:i+1,:])
+            self._deeplift_ref[op.name] = r/self.train_x.shape[0]
+        # print('DeepLIFT: references ready')
+        sys.stdout.flush()
 
 
 """
@@ -397,6 +465,7 @@ attribution_methods = OrderedDict({
     'intgrad': (IntegratedGradients, 3),
     'elrp': (EpsilonLRP, 4),
     'deeplift': (DeepLIFTRescale, 5),
+    'deepliftshap': (DeepLIFTRescaleSHAP, 7),
     'occlusion': (Occlusion, 6)
 })
 
